@@ -1,0 +1,1182 @@
+using Newtonsoft.Json;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml;
+using System.Xml.Serialization;
+
+namespace WatchDog
+{
+    class Program
+    {
+        private static ConcurrentQueue<Sessions> messageQueue = new ConcurrentQueue<Sessions>();
+
+        static bool isThreadOpenNewSessionActive = false;
+        static bool isThreadTerminateSessionActive = false;
+
+        static bool IsDebug = false;
+
+        static bool ShouldCheckSlaves = true;
+
+        public static List<Sessions> Slaves = new List<Sessions>();
+        public static List<Sessions> SlavesTerminated = new List<Sessions>();
+        public static List<Sessions> PendingSlavesTerminated = new List<Sessions>();
+        public static List<SessionDetails> SDetails = new List<SessionDetails>();
+
+        static readonly object _object = new object();
+        static readonly object _queueobject = new object();
+
+        private static TcpListener tcpListener;
+        private static Thread listenerThread;
+
+        static void Main(string[] args)
+        {
+            //string ServerIP1 = "5.199.161.189";
+            //var test = GetSessionIDsList("qwinsta", $"/server:{ServerIP1}");
+            Process[] proc = Process.GetProcessesByName("WatchDog");
+            if (proc != null && proc.Length == 1)
+            {
+                try
+                {
+                    //string NamedPipeServerStreamName = args[0];
+                    Thread tCheckSlaves = new Thread(new ThreadStart(CheckSlaves));
+                    tCheckSlaves.Name = "WatchDogCheckSlaves";
+                    tCheckSlaves.Start();
+                    Thread tCreateJson = new Thread(new ThreadStart(CreateJsonFile));
+                    tCreateJson.Name = "CreateJsonFile";
+                    tCreateJson.Start();
+                    Thread tCreateJsonFull = new Thread(new ThreadStart(CreateJsonFileFull));
+                    tCreateJsonFull.Name = "CreateJsonFileFull";
+                    tCreateJsonFull.Start();
+                    //CreateSocketMaster(GetServerIP());
+                    CreateSocketMaster("FBAutoPosterWatchDogServer");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex.Message);
+                }
+            }
+        }
+
+        private static void CreateJsonFile()
+        {
+            while (true)
+            {
+                try
+                {
+                    Thread.Sleep(120000);
+                    SessionView view = new SessionView();
+                    view.SessionRepresentationHighLevelList = new List<SessionRepresentationHighLevel>();
+                    view.SessionRepresentationList = new List<SessionRepresentation>();
+                    if (File.Exists(@"C:\inetpub\wwwroot\AnubisAPI\ServersData.xml"))
+                    {
+                        File.Delete(@"C:\inetpub\wwwroot\AnubisAPI\ServersData.xml");
+                    }
+                    if (Slaves != null && Slaves.Count > 0)
+                    {
+                        var orderBySlaves = from s in Slaves orderby s.ServerIP select s;
+                        for (int i = 0; i < orderBySlaves.ToList().Count; i++)
+                        {
+                            Sessions s = Slaves.ToList()[i];
+                            if (s.Env != "ILASHK" && s.Env != "Israel-Appel")
+                            {
+                                SessionRepresentation r = new SessionRepresentation();
+                                r.ApplicationName = s.ApplicationName;
+                                r.Env = s.Env;
+                                r.InstanceType = s.InstanceType;
+                                r.ProcessID = s.ProcessID;
+                                r.RDPID = s.RDPID;
+                                r.ServerIP = s.ServerIP;
+                                r.SessionID = s.SessionID;
+                                r.Color = "Green";
+                                var isPendingBeforeTerminated = from p in PendingSlavesTerminated where p.ProcessID == s.ProcessID && p.SessionID == s.SessionID && p.Env == s.Env && p.ApplicationName == s.ApplicationName select p;
+                                if (isPendingBeforeTerminated != null && isPendingBeforeTerminated.Any())
+                                {
+                                    r.Color = "Yellow";
+                                }
+                                var isTerminated = from sl in SlavesTerminated where sl.ProcessID == s.ProcessID && sl.SessionID == s.SessionID && sl.ApplicationName == s.ApplicationName && sl.Env == s.Env select s;
+                                if (isTerminated != null && isTerminated.Any())
+                                {
+                                    r.Color = "Black";
+                                }
+                                view.SessionRepresentationList.Add(r);
+                            }
+                        }
+                        var aggregatedSessions = Slaves.GroupBy(s => new { s.ServerIP, s.ApplicationName, s.Env })
+            .Select(g => new
+            {
+                ServerIP = g.Key.ServerIP,
+                ApplicationName = g.Key.ApplicationName,
+                Env = g.Key.Env,
+                Count = g.Count(),
+                CPU = g.Select(s => s.CPU).FirstOrDefault(),
+                Memory = g.Select(s => s.Memory).FirstOrDefault(),
+                MaxSessionsAllowed = g.Select(s => s.MaxSessionsAllowed).FirstOrDefault(),
+                IsEnoughResourcesToOpenSessions = g.Select(s => s.IsEnoughResourcesToOpenSessions).FirstOrDefault(),
+                TasksWaiting = g.Select(s => s.TasksWaiting).FirstOrDefault(),
+                LockedAvatars = g.Select(s=>s.LockedAvatars).FirstOrDefault(),
+                AvailableAvatars = g.Select(s => s.AvailableAvatars).FirstOrDefault(),
+                InPenaltyAvatars = g.Select(s => s.InPenaltyAvatars).FirstOrDefault()
+
+            });
+
+                        var obaggregatedSessions = from a in aggregatedSessions orderby a.ServerIP select a;
+                        foreach (var item in obaggregatedSessions.ToList())
+                        {
+                            if (item.Env != "ILASHK" && item.Env != "Israel-Appel")
+                            {
+                                SessionRepresentationHighLevel srh = new SessionRepresentationHighLevel();
+                                srh.AmmountOfInstances = item.Count;
+                                srh.ApplicationName = item.ApplicationName;
+                                srh.Env = item.Env;
+                                srh.ServerIP = item.ServerIP;
+                                srh.CPU = item.CPU;
+                                srh.IsEnoughResourcesToOpenSessions = item.IsEnoughResourcesToOpenSessions;
+                                srh.Memory = item.Memory;
+                                srh.MaxSessionsAllowed = item.MaxSessionsAllowed;
+                                srh.TasksWaiting = item.TasksWaiting;
+                                srh.LockedAvatars = item.LockedAvatars;
+                                srh.AvailableAvatars = item.AvailableAvatars;
+                                srh.InPenaltyAvatars = item.InPenaltyAvatars;
+                                if (srh.IsEnoughResourcesToOpenSessions)
+                                {
+                                    srh.Color = "Green";
+                                }
+                                else
+                                {
+                                    srh.Color = "Black";
+                                }
+                                view.SessionRepresentationHighLevelList.Add(srh);
+                            }
+                        }
+                        SaveXMLFile(view, "ServersData.xml");
+                    }
+                }
+                catch
+                {
+
+                }
+            }
+        }
+        private static void CreateJsonFileFull()
+        {
+            while (true)
+            {
+                try
+                {
+                    Thread.Sleep(120000);
+                    SessionView view = new SessionView();
+                    view.SessionRepresentationHighLevelList = new List<SessionRepresentationHighLevel>();
+                    view.SessionRepresentationList = new List<SessionRepresentation>();
+                    if (File.Exists(@"C:\inetpub\wwwroot\AnubisAPI\ServersDataFull.xml"))
+                    {
+                        File.Delete(@"C:\inetpub\wwwroot\AnubisAPI\ServersDataFull.xml");
+                    }
+                    if (Slaves != null && Slaves.Count > 0)
+                    {
+                        var orderBySlaves = from s in Slaves orderby s.ServerIP select s;
+                        for (int i = 0; i < orderBySlaves.ToList().Count; i++)
+                        {
+                            Sessions s = Slaves.ToList()[i];
+                            SessionRepresentation r = new SessionRepresentation();
+                            r.ApplicationName = s.ApplicationName;
+                            r.Env = s.Env;
+                            r.InstanceType = s.InstanceType;
+                            r.ProcessID = s.ProcessID;
+                            r.RDPID = s.RDPID;
+                            r.ServerIP = s.ServerIP;
+                            r.SessionID = s.SessionID;
+                            r.Color = "Green";
+                            var isPendingBeforeTerminated = from p in PendingSlavesTerminated where p.ProcessID == s.ProcessID && p.SessionID == s.SessionID && p.Env == s.Env && p.ApplicationName == s.ApplicationName select p;
+                            if (isPendingBeforeTerminated != null && isPendingBeforeTerminated.Any())
+                            {
+                                r.Color = "Yellow";
+                            }
+                            var isTerminated = from sl in SlavesTerminated where sl.ProcessID == s.ProcessID && sl.SessionID == s.SessionID && sl.ApplicationName == s.ApplicationName && sl.Env == s.Env select s;
+                            if (isTerminated != null && isTerminated.Any())
+                            {
+                                r.Color = "Black";
+                            }
+                            view.SessionRepresentationList.Add(r);
+
+                        }
+                        var aggregatedSessions = Slaves.GroupBy(s => new { s.ServerIP, s.ApplicationName, s.Env })
+            .Select(g => new
+            {
+                ServerIP = g.Key.ServerIP,
+                ApplicationName = g.Key.ApplicationName,
+                Env = g.Key.Env,
+                Count = g.Count(),
+                CPU = g.Select(s => s.CPU).FirstOrDefault(),
+                Memory = g.Select(s => s.Memory).FirstOrDefault(),
+                MaxSessionsAllowed = g.Select(s => s.MaxSessionsAllowed).FirstOrDefault(),
+                IsEnoughResourcesToOpenSessions = g.Select(s => s.IsEnoughResourcesToOpenSessions).FirstOrDefault(),
+                TasksWaiting = g.Select(s => s.TasksWaiting).FirstOrDefault(),
+                LockedAvatars = g.Select(s => s.LockedAvatars).FirstOrDefault(),
+                AvailableAvatars = g.Select(s => s.AvailableAvatars).FirstOrDefault(),
+                InPenaltyAvatars = g.Select(s => s.InPenaltyAvatars).FirstOrDefault()
+
+            });
+                        var obaggregatedSessions = from a in aggregatedSessions orderby a.ServerIP select a;
+                        foreach (var item in obaggregatedSessions.ToList())
+                        {
+                            SessionRepresentationHighLevel srh = new SessionRepresentationHighLevel();
+                            srh.AmmountOfInstances = item.Count;
+                            srh.ApplicationName = item.ApplicationName;
+                            srh.Env = item.Env;
+                            srh.ServerIP = item.ServerIP;
+                            srh.CPU = item.CPU;
+                            srh.IsEnoughResourcesToOpenSessions = item.IsEnoughResourcesToOpenSessions;
+                            srh.Memory = item.Memory;
+                            srh.MaxSessionsAllowed = item.MaxSessionsAllowed;
+                            srh.TasksWaiting = item.TasksWaiting;
+                            srh.LockedAvatars = item.LockedAvatars;
+                            srh.AvailableAvatars = item.AvailableAvatars;
+                            srh.InPenaltyAvatars = item.InPenaltyAvatars;
+                            if (srh.IsEnoughResourcesToOpenSessions)
+                            {
+                                srh.Color = "Green";
+                            }
+                            else
+                            {
+                                srh.Color = "Red";
+                            }
+                            view.SessionRepresentationHighLevelList.Add(srh);
+                        }
+                        SaveXMLFile(view, "ServersDataFull.xml");
+                    }
+                }
+                catch
+                {
+
+                }
+            }
+        }
+
+        private static void SaveXMLFile(SessionView view, string FileName)
+        {
+            XmlSerializer xsSubmit = new XmlSerializer(view.GetType());
+            var xml = string.Empty;
+
+            using (var sww = new StringWriter())
+            {
+                using (XmlWriter writer = XmlWriter.Create(sww))
+                {
+                    xsSubmit.Serialize(writer, view);
+                    xml = sww.ToString(); // Your XML
+                    File.AppendAllText(@"C:\inetpub\wwwroot\AnubisAPI\" + FileName, xml);
+                }
+            }
+        }
+
+        private static void CreateSocketMaster(string NamedPipeServerStreamName)
+        {
+            tcpListener = new TcpListener(IPAddress.Any, 8888);
+            listenerThread = new Thread(new ThreadStart(ListenForClients));
+            listenerThread.Start();
+        }
+
+        private static void ListenForClients()
+        {
+            tcpListener.Start();
+
+            while (true)
+            {
+                TcpClient client = tcpListener.AcceptTcpClient();
+                //Console.WriteLine("Client connected!");
+
+                Thread clientThread = new Thread(new ParameterizedThreadStart(HandleClientComm));
+                clientThread.Start(client);
+            }
+        }
+
+        private static void HandleClientComm(object clientObj)
+        {
+            TcpClient tcpClient = (TcpClient)clientObj;
+            NetworkStream clientStream = tcpClient.GetStream();
+
+            while (true)
+            {
+                try
+                {
+                    // Read the message length
+                    byte[] lengthBuffer = new byte[4];
+                    int bytesRead = clientStream.Read(lengthBuffer, 0, 4);
+                    if (bytesRead == 0)
+                    {
+                        //Console.WriteLine("Client disconnected.");
+                        break;
+                    }
+
+                    int messageLength = BitConverter.ToInt32(lengthBuffer, 0);
+                    byte[] messageBuffer = new byte[messageLength];
+
+                    // Read the message
+                    bytesRead = 0;
+                    while (bytesRead < messageLength)
+                    {
+                        bytesRead += clientStream.Read(messageBuffer, bytesRead, messageLength - bytesRead);
+                    }
+
+                    string json = Encoding.ASCII.GetString(messageBuffer, 0, bytesRead);
+
+                    Sessions session = JsonConvert.DeserializeObject<Sessions>(json);
+
+                    Thread tWrite = new Thread(new ParameterizedThreadStart(WriteConsole));
+                    tWrite.Name = "WriteConsole";
+                    tWrite.Start(session);
+
+                    // Process the session data as needed
+
+                    // Handle Incoming message
+                    lock (_object)
+                    {
+                        var isExist = Slaves.Any(s => s.SessionID == session.SessionID && s.ApplicationName == session.ApplicationName && s.Env == session.Env);
+                        var isTerminated = SlavesTerminated.Any(s => s.ProcessID == session.ProcessID && s.SessionID == session.SessionID);
+
+                        if (!isExist && !isTerminated)
+                        {
+                            if (!session.IsOnUpdate)
+                            {
+                                session.startTime = DateTime.Now;
+                                Slaves.Add(session);
+                                SessionDetails sDItem = new SessionDetails
+                                {
+                                    IsEnoughResources = session.IsEnoughResourcesToOpenSessions,
+                                    ServerIP = session.ServerIP,
+                                    TimeStamp = DateTime.Now
+                                };
+                                SDetails.Add(sDItem);
+                            }
+                            else
+                            {
+                                Slaves.Remove(session);
+                                SlavesTerminated.Remove(session);
+                                PendingSlavesTerminated.Remove(session);
+                            }
+                        }
+                        else if (!isTerminated)
+                        {
+                            if (!session.IsOnUpdate)
+                            {
+                                var existingSession = Slaves.FirstOrDefault(s => s.SessionID == session.SessionID && s.ApplicationName == session.ApplicationName && s.Env == session.Env);
+                                session.startTime = existingSession?.startTime ?? DateTime.Now;
+                                session.RDPID = existingSession?.RDPID ?? 0;
+
+                                var pending = PendingSlavesTerminated.Any(s => s.ProcessID == session.ProcessID && s.SessionID == session.SessionID);
+                                if (pending)
+                                {
+                                    Thread tteleSend = new Thread(new ParameterizedThreadStart(SendTelegram));
+                                    tteleSend.Name = "SendTelegram";
+                                    tteleSend.Start(session);
+                                    PendingSlavesTerminated.RemoveAll(p => p.ProcessID == session.ProcessID && p.SessionID == session.SessionID);
+                                }
+                                PendingSlavesTerminated.Remove(session);
+                                Slaves.Remove(existingSession);
+                                Slaves.Add(session);
+
+                                SessionDetails sDItem = new SessionDetails
+                                {
+                                    IsEnoughResources = session.IsEnoughResourcesToOpenSessions,
+                                    ServerIP = session.ServerIP,
+                                    TimeStamp = DateTime.Now
+                                };
+                                SDetails.Add(sDItem);
+                            }
+                            else
+                            {
+                                Slaves.Remove(session);
+                                SlavesTerminated.Remove(session);
+                                PendingSlavesTerminated.Remove(session);
+                            }
+                        }
+                    }
+
+                    // Prepare response
+                    Sessions msgToSend;
+                    if (!session.IsOnUpdate && TryDequeueBySessionID(session, out msgToSend))
+                    {
+                        string responseJson = JsonConvert.SerializeObject(msgToSend);
+                        byte[] responseBytes = Encoding.ASCII.GetBytes(responseJson);
+                        byte[] responseLengthBytes = BitConverter.GetBytes(responseBytes.Length);
+                        clientStream.Write(responseLengthBytes, 0, responseLengthBytes.Length);
+                        clientStream.Write(responseBytes, 0, responseBytes.Length);
+                        clientStream.Flush();
+                    }
+                    else
+                    {
+                        msgToSend = new Sessions
+                        {
+                            Message = (SlavesTerminated.Any(t => t.SessionID == session.SessionID && t.ProcessID == session.ProcessID && t.Env == session.Env && t.ApplicationName == session.ApplicationName) && SlavesTerminated.FirstOrDefault(t => t.SessionID == session.SessionID).InstanceType == "0") ? "Terminate" : "OK",
+                            SessionID = session.SessionID,
+                            ApplicationName = session.ApplicationName,
+                            Env = session.Env,
+                            ProcessID = session.ProcessID
+                        };
+
+                        string responseJson = JsonConvert.SerializeObject(msgToSend);
+                        byte[] responseBytes = Encoding.ASCII.GetBytes(responseJson);
+                        byte[] responseLengthBytes = BitConverter.GetBytes(responseBytes.Length);
+                        clientStream.Write(responseLengthBytes, 0, responseLengthBytes.Length);
+                        clientStream.Write(responseBytes, 0, responseBytes.Length);
+                        clientStream.Flush();
+                    }
+
+                    #region DecideBasedOnDataFromSlave
+                    if (session.InstanceType == "1" && ShouldCheckSlaves)
+                    {
+                        int maxTasksPerSessionPerHour = 40;
+                        var all = from sl in Slaves where sl.ApplicationName == session.ApplicationName && sl.Env == session.Env select sl;
+                        int totalTasksPerHour = all.ToList().Count * maxTasksPerSessionPerHour;
+                        int requiredSessions = (int)Math.Ceiling((double)session.TasksWaiting / maxTasksPerSessionPerHour);
+                        requiredSessions -= all.ToList().Count;
+                        if (isThreadTerminateSessionActive == false && isThreadOpenNewSessionActive == false)
+                        {
+                            #region Sessions termination
+                            if (session.startTime.AddMinutes(10) < DateTime.Now && (requiredSessions < 0 && all.ToList().Count > 1))// || (all.ToList().Count > requiredSessions && requiredSessions == 1))
+                            {
+                                isThreadTerminateSessionActive = true;
+
+                                int sessionsToClose = 0;
+                                int absRequiredSessions = 0;
+                                if (requiredSessions <= 0)
+                                {
+                                    sessionsToClose = requiredSessions * -1;// all.ToList().Count - 1;
+                                    absRequiredSessions = all.ToList().Count + requiredSessions;// 1;
+                                }
+                                if (sessionsToClose > 0)
+                                {
+                                    TelegramSendMessage(session.TelegramSessionFailed, "Env:" + session.Env + $" Number of sessions opened:{all.ToList().Count} Number of tasks waiting:{session.TasksWaiting} Number of requierd sessions:{absRequiredSessions} WatchDog will terminate {sessionsToClose} sessions", session.TelegramBotUrl, session.TelegramApiToken);
+                                }
+                                for (int st = 0; st < sessionsToClose; st++)
+                                {
+                                    var slaves = from sl in Slaves where sl.ApplicationName == session.ApplicationName && sl.Env == session.Env && sl.InstanceType == "0" select sl;
+                                    if (slaves != null && slaves.Any())
+                                    {
+                                        var item = slaves.LastOrDefault();
+                                        item.Message = "Terminate";
+                                        EnqueueMessage(item);
+                                        lock (_object)
+                                        {
+                                            Slaves.Remove(item);
+                                            SlavesTerminated.Add(item);
+
+                                        }
+                                        session.startTime = DateTime.Now;
+                                        TelegramSendMessage(session.TelegramSessionFailed, "Env:" + session.Env + $" WatchDog will terminate one session SessionID:{item.SessionID} ProccessID:{item.ProcessID}", session.TelegramBotUrl, session.TelegramApiToken);
+
+                                    }
+                                }
+                                isThreadTerminateSessionActive = false;
+                            }
+                            #endregion
+                        }
+                        if (requiredSessions > 0 && all.ToList().Count < session.MaxSessionsAllowed)
+                        {
+                            #region Sessions creation
+                            if (session.startTime.AddMinutes(10) < DateTime.Now && !isThreadOpenNewSessionActive)
+                            {
+                                isThreadOpenNewSessionActive = true;
+                                int numberOfSessionsToOpen = 0;
+                                if (requiredSessions > session.MaxSessionsAllowed)
+                                {
+                                    requiredSessions = session.MaxSessionsAllowed;
+                                }
+                                numberOfSessionsToOpen = requiredSessions - all.ToList().Count;
+                                if (numberOfSessionsToOpen > 0)
+                                {
+                                    bool IsEnoughResourcesToOpenSessions = CheckIfEnoughResourcesOnServer(session.ServerIP);
+                                    if (IsEnoughResourcesToOpenSessions)
+                                    {
+                                        TelegramSendMessage(session.TelegramSessionFailed, "Env:" + session.Env + $" Number of sessions opened:{all.ToList().Count} Number of tasks waiting:{session.TasksWaiting} Number or requiered sessions:{requiredSessions} WatchDog will open  {numberOfSessionsToOpen} new Sessions", session.TelegramBotUrl, session.TelegramApiToken);
+                                        session.startTime = DateTime.Now;
+                                        ReplicaSessionToOpen replica = new ReplicaSessionToOpen();
+                                        replica.session = session;
+                                        replica.SessionToOpen = numberOfSessionsToOpen;
+                                        Thread threadOpenNewSession = new Thread(new ParameterizedThreadStart(OpenNewSession));
+                                        threadOpenNewSession.Name = "threadOpenNewSession";
+                                        threadOpenNewSession.Start(replica);
+                                        session.startTime = DateTime.Now;
+                                        //threadOpenNewSession.Join();
+                                    }
+                                    else
+                                    {
+                                        isThreadOpenNewSessionActive = false;
+                                    }
+                                }
+                                else
+                                {
+                                    isThreadOpenNewSessionActive = false;
+                                }
+                            }
+                            #endregion
+                        }
+                    }
+                    #endregion
+
+                    // Implement any other session-based logic here
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error: {ex.Message}");
+                    break;
+                }
+            }
+
+            tcpClient.Close();
+        }
+        
+        private static void WriteConsole(object obj)
+        {
+            Sessions s = (Sessions)obj;
+            Console.WriteLine($"IP:{s.ServerIP} Env:{s.Env} ApplicationName:{s.ApplicationName} SessionID:{s.SessionID} ProccessID:{s.ProcessID} Connected {DateTime.Now.ToString()}");
+        }
+        private static void SendTelegram(object obj)
+        {
+            Sessions s = (Sessions)obj;
+            TelegramSendMessage(s.TelegramSessionFailed, $"IP:{s.ServerIP} Env:{s.Env} ApplicationName:{s.ApplicationName} SessionID:{s.SessionID} ProccessID:{s.ProcessID} has reconnected {DateTime.Now.ToString()}", s.TelegramBotUrl, s.TelegramApiToken);
+        }
+
+        private static bool CheckIfEnoughResourcesOnServer(string serverIP)
+        {
+            lock (_object)
+            {
+                var item = from s in SDetails where s.ServerIP == serverIP orderby s.TimeStamp descending select s;
+                if (item != null && item.Any())
+                {
+                    return item.FirstOrDefault().IsEnoughResources;
+                }
+                return false;
+            }
+        }
+
+        private static void OpenNewSession(object s)
+        {
+            ReplicaSessionToOpen replica = (ReplicaSessionToOpen)s;
+            Sessions Sessions = replica.session;
+            Sessions.startTime = DateTime.Now;
+            int SessionsToOpen = replica.SessionToOpen;
+            string teleMessage = string.Empty;
+            bool IsEnoughResources = CheckIfEnoughResourcesOnServer(Sessions.ServerIP);
+            for (int i = 0; i < SessionsToOpen; i++)
+            {
+                IsEnoughResources = CheckIfEnoughResourcesOnServer(Sessions.ServerIP);
+                if (IsEnoughResources)
+                {
+                    int rdpID = 0;
+                    int newSessionID = CreateNewEngineInstance(Sessions.UserName, Sessions.Password, Sessions.RunTimeDir, "0", Sessions.ServerIP, out rdpID);
+                    if (newSessionID > 0)
+                    {
+                        teleMessage = teleMessage + "Env:" + Sessions.Env + " ApplicationName:" + Sessions.ApplicationName + " on session:" + newSessionID + " created";
+                        teleMessage = teleMessage + System.Environment.NewLine;
+                        Thread.Sleep(20000);
+                        Sessions.startTime = DateTime.Now;
+                        Sessions.RDPID = rdpID;
+                    }
+                    else
+                    {
+                        teleMessage = teleMessage + "Env:" + Sessions.Env + " ApplicationName:" + Sessions.ApplicationName + " failed to create new session";
+                        teleMessage = teleMessage + System.Environment.NewLine;
+                    }
+                }
+                else
+                {
+                    TelegramSendMessage(Sessions.TelegramSessionFailed, "Not enough resources to complete sessions openning at " + "Env:" + Sessions.Env + " ApplicationName:" + Sessions.ApplicationName, Sessions.TelegramBotUrl, Sessions.TelegramApiToken);
+                    TelegramSendMessage(Sessions.TelegramSessionFailed, teleMessage, Sessions.TelegramBotUrl, Sessions.TelegramApiToken);
+                }
+            }
+            TelegramSendMessage(Sessions.TelegramSessionFailed, teleMessage, Sessions.TelegramBotUrl, Sessions.TelegramApiToken);
+            isThreadOpenNewSessionActive = false;
+        }
+
+
+
+        public static bool TryDequeueBySessionID(Sessions Sessions, out Sessions session)
+        {
+            session = null;
+            bool found = false;
+            lock (messageQueue)
+            {
+                Sessions tempSession;
+                var newQueue = new ConcurrentQueue<Sessions>();
+                while (messageQueue.TryDequeue(out tempSession))
+                {
+                    if (tempSession.SessionID == Sessions.SessionID && tempSession.Env == Sessions.Env && tempSession.ApplicationName == Sessions.ApplicationName && tempSession.ProcessID == Sessions.ProcessID)
+                    {
+                        session = tempSession;
+                        found = true;
+                    }
+                    else
+                    {
+                        newQueue.Enqueue(tempSession);
+                    }
+                }
+                messageQueue = newQueue;
+            }
+            return found;
+        }
+
+
+        public static void EnqueueMessage(Sessions message)
+        {
+            try
+            {
+                lock (_queueobject)
+                {
+                    messageQueue.Enqueue(message);
+                }
+            }
+            catch(Exception ex)
+            {
+                string teleMessage = "Env:" + message.Env + " ApplicationName:" + message.ApplicationName + " Error Enqueue message, Error:" + ex.Message + " Message:" + message.Message;
+            }
+        }
+
+        private static void CheckSlaves()
+        {
+            while (true)
+            {
+                if (!IsDebug && ShouldCheckSlaves)
+                {
+                    try
+                    {
+                        try
+                        {
+                            for (int i = 0; i < Slaves.Count; i++)
+                            {
+                                try
+                                {
+                                    Sessions s = Slaves[i];
+                                    var isTerminated = from sl in SlavesTerminated where sl.ProcessID == s.ProcessID && sl.SessionID == s.SessionID && sl.ApplicationName == s.ApplicationName && sl.Env == s.Env select s;
+                                    if (isTerminated == null || !isTerminated.Any())
+                                    {
+                                        bool IsHandled = false;
+                                        if (s.Timestamp.AddMinutes(5) < DateTime.Now)
+                                        {
+                                            if (ShouldCheckSlaves)
+                                            {
+                                                bool isPIdRun = CheckIfProccessIsRunning(s);
+                                                if (!isPIdRun)
+                                                {
+                                                    ShouldCheckSlaves = false;
+                                                    lock (_object)
+                                                    {
+                                                        Slaves.Remove(s);
+                                                        SlavesTerminated.Add(s);
+
+                                                    }
+                                                    string teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + s.SessionID + " of proccess:" + s.ProcessID + " Which is not running and last time pinged:" + s.Timestamp.ToString() + " Current datetime" + DateTime.Now + " The proccess does not exists, WatchDog will try to fix the situation";
+                                                    TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+                                                    Thread t = new Thread(new ParameterizedThreadStart(HandleSessionDownCase));
+                                                    t.Name = s.Env + " " + s.ApplicationName + " " + s.SessionID;
+                                                    t.Start(s);
+                                                    t.Join();
+                                                    IsHandled = true;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                IsHandled = true; 
+                                            }
+                                        }
+                                        if (!IsHandled)
+                                        {
+                                            if (s.Timestamp.AddMinutes(5) < DateTime.Now)
+                                            {
+                                                var isPendingBeforeTerminated = from p in PendingSlavesTerminated where p.ProcessID == s.ProcessID && p.SessionID == s.SessionID && p.Env == s.Env && p.ApplicationName == s.ApplicationName select p;
+                                                if (isPendingBeforeTerminated != null && isPendingBeforeTerminated.Any() && isPendingBeforeTerminated.ToList().Count > 20)
+                                                {
+                                                    string teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + s.SessionID + " of proccess:" + s.ProcessID + " last time pinged:" + s.Timestamp.ToString() + " Current datetime" + DateTime.Now;
+                                                    TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+                                                    lock (_object)
+                                                    {
+                                                        SlavesTerminated.Add(s);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    lock (_object)
+                                                    {
+                                                        if (isPendingBeforeTerminated == null || !isPendingBeforeTerminated.Any())
+                                                        {
+                                                            string teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + s.SessionID + " of proccess:" + s.ProcessID + " last time pinged:" + s.Timestamp.ToString() + " Current datetime" + DateTime.Now + " Pending to be termination";
+                                                            TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+                                                        }
+                                                        PendingSlavesTerminated.Add(s);
+                                                    }
+                                                }
+                                            }
+                                            if (s.Timestamp.AddMinutes(10) < DateTime.Now)
+                                            {
+                                                if (ShouldCheckSlaves)
+                                                {
+                                                    ShouldCheckSlaves = false;
+                                                    string teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + s.SessionID + " of proccess:" + s.ProcessID + " last time pinged:" + s.Timestamp.ToString() + " Current datetime" + DateTime.Now + " Over 50 minutes without ping, WatchDog will try to fix the situation";
+                                                    TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+                                                    Thread t = new Thread(new ParameterizedThreadStart(HandleSessionDownCase));
+                                                    t.Name = s.Env + " " + s.ApplicationName + " " + s.SessionID;
+                                                    t.Start(s);
+                                                    t.Join();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception ex) { }
+                            }
+                        }
+                        catch (Exception ex)
+                        { }
+                    }
+                    catch (Exception ex)
+                    {
+
+                    }
+                }
+                if(!ShouldCheckSlaves)
+                {
+                    Thread.Sleep(120000);
+                }
+                Thread.Sleep(30000);
+            }
+        }
+
+        private static bool CheckIfProccessIsRunning(Sessions s)
+        {
+            string remoteComputerName = s.ServerIP;
+            string exeDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+            int pidToCheck = s.ProcessID; // Replace with the PID you want to check
+            string psexecPath = exeDirectory + @"\" + "psexec64.exe";
+            string command = $"tasklist /S {remoteComputerName} /FI \"PID eq {pidToCheck}\"";
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = psexecPath,
+                    Arguments = $@"\\{remoteComputerName} cmd /c {command}",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process process = Process.Start(psi))
+                {
+                    using (StreamReader reader = process.StandardOutput)
+                    {
+                        string output = reader.ReadToEnd();
+
+                        // Check if the PID is in the output
+                        bool isRunning = output.Contains(pidToCheck.ToString());
+                        return isRunning;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return true;
+            }
+        }
+        private static bool CheckIfProccessIsRunning(string ApplicationName, string ServerIP, int SessionID)
+        {
+            string remoteComputerName = ServerIP;
+            string exeDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+            string processNameToCheck = ApplicationName; // Process name with extension, e.g., "notepad.exe"
+            string psexecPath = exeDirectory + @"\psexec64.exe";
+            string command = $"tasklist /S {remoteComputerName} /FI \"IMAGENAME eq {processNameToCheck}\" /V"; // /V for detailed output
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = psexecPath,
+                    Arguments = $@"\\{remoteComputerName} cmd /c {command}",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process process = Process.Start(psi))
+                {
+                    using (StreamReader reader = process.StandardOutput)
+                    {
+                        string output = reader.ReadToEnd();
+
+                        // Check if the process name and session ID are in the output
+                        string sessionIDString = SessionID.ToString();
+                        bool isRunning = output.Contains(processNameToCheck) &&
+                                         output.Contains(sessionIDString);
+
+                        return isRunning;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return false;
+            }
+        }
+
+        private static void HandleSessionDownCase(object objSession)
+        {
+            Sessions s = (Sessions)objSession;
+            //string teleMessage = s.ApplicationName + " on session:" + s.SessionID + " of proccess:" + s.ProcessID + " last time pinged:" + s.Timestamp.ToString() + " Current datetime" + DateTime.Now;
+            //TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+            string teleMessage = string.Empty;
+            if (s.InstanceType == "0")
+            {
+                HandleSlaveSessionDownCase(s);
+            }
+            if (s.InstanceType == "1")
+            {
+                HandleMasterSessionDownCase(s);
+            }
+            ShouldCheckSlaves = true;
+            return;
+        }
+
+        private static void HandleMasterSessionDownCase(Sessions s)
+        {
+            lock (_object)
+            {
+                Slaves.Remove(s);
+                SlavesTerminated.Add(s);
+            }
+            LogOffSession(s);
+            string teleMessage = string.Empty;
+            var all = from si in Slaves where si.Env == s.Env && si.ApplicationName == s.ApplicationName && si.ServerIP == s.ServerIP select si;
+            if (all != null && all.Any())
+            {
+                while (all != null && all.Any())
+                {
+                    for (int i = 0; i < all.ToList().Count; i++)
+                    {
+                        var item = all.ToList()[i];
+                        lock (_object)
+                        {
+                            Slaves.Remove(item);
+                            SlavesTerminated.Add(item);
+                        }
+                        LogOffSession(item, 0);
+                    }
+                    all = from si in Slaves where si.Env == s.Env && si.ApplicationName == s.ApplicationName && si.ServerIP == s.ServerIP select si;
+                }
+                Thread.Sleep(90000);
+                int rdpID = 0;
+                int newSessionID = CreateNewEngineInstance(s.UserName, s.Password, s.RunTimeDir, "1", s.ServerIP, out rdpID);
+                if (newSessionID > 0)
+                {
+                    teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + newSessionID + " created";
+                    teleMessage = teleMessage + System.Environment.NewLine;
+                    Thread.Sleep(20000);
+                    s.SessionID = newSessionID;
+                    bool isPIdRun = CheckIfProccessIsRunning("FaceBookPublisher.EngineController.exe", s.ServerIP, newSessionID);
+                    int retries = 0;
+                    while(!isPIdRun && retries<3)
+                    {
+                        Thread.Sleep(20000);
+                        isPIdRun = CheckIfProccessIsRunning("FaceBookPublisher.EngineController.exe", s.ServerIP, newSessionID);
+                        retries++;
+                    }
+                    if(!isPIdRun)
+                    {
+                        teleMessage = "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " on session:" + newSessionID + " failed to execute the engine";
+                        teleMessage = teleMessage + System.Environment.NewLine;
+                    }
+                    s.startTime = DateTime.Now;
+                    s.RDPID = rdpID;
+                }
+                else
+                {
+                    teleMessage =  "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " failed to create new session";
+                    teleMessage = teleMessage + System.Environment.NewLine;
+                }
+                TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+            }
+        }
+
+        private static void HandleSlaveSessionDownCase(Sessions s)
+        {
+            LogOffSession(s);
+            string teleMessage= "Env:" + s.Env + " ApplicationName:" + s.ApplicationName + " session was closed, master will take charge of the tasks";
+            TelegramSendMessage(s.TelegramSessionFailed, teleMessage, s.TelegramBotUrl, s.TelegramApiToken);
+            var master = from si in Slaves where si.Env == s.Env && si.ApplicationName == s.ApplicationName && si.InstanceType == "1" && si.ServerIP == s.ServerIP select si;
+            if (master != null && master.Any())
+            {
+                string strIds = "";
+                foreach (var item in s.TheTasksInSession)
+                {
+                    strIds = strIds + item.ToString() + ",";
+                }
+                master.FirstOrDefault().Message = "Restart " + s.ProcessID;// strIds.Substring(0, strIds.Length - 1);
+                EnqueueMessage(master.FirstOrDefault());
+            }
+        }
+
+        public static string TelegramSendMessage(string destID, string text, string TelegramBotUrl, string TelegramApiToken)
+        {
+            try
+            {
+                string urlString = string.Format(TelegramBotUrl, TelegramApiToken, destID, text);
+                WebClient webclient = new WebClient();
+                webclient.DownloadString(urlString);
+                return "OK";
+            }
+            catch (Exception ex)
+            {
+                return string.Empty;
+            }
+        }
+        static void LogOffSession(Sessions s,int Idle=90000)
+        {
+            string exeDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+            //psexec \\RemoteServer -u Username -p Password -accepteula taskkill /S RemoteServer /PID 198999 /F
+            KillRemoteProccess(exeDirectory + @"\", s.ProcessID, s.UserName, s.Password, s.ServerIP);
+            Thread.Sleep(30000);
+            RunExecutableOnSession(exeDirectory + @"\", s.SessionID, @"C:\Windows\System32\logoff.exe", s.UserName, s.Password, s.ServerIP);
+            Thread.Sleep(Idle);
+        }
+
+
+
+        private static void RunExecutableOnSession(string RunTimeDir, int sessionID, string executablePath, string username, string password, string remoteServer)
+        {
+            // Run PsExec to start the executable on the specified session ID of the remote server
+            ProcessStartInfo psi = new ProcessStartInfo
+            {
+                FileName = RunTimeDir + "psexec64.exe",
+                // Arguments to execute the executable on the specified session ID of the remote server
+                Arguments = $@"\\{remoteServer} -i {sessionID} -u {username} -p {password} -accepteula -d -e {executablePath}",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                Verb = "runas"
+            };
+
+            Process.Start(psi);
+        }
+        private static void KillRemoteProccess(string RunTimeDir, int PID, string username, string password, string remoteServer)
+        {
+            try
+            {
+                // Run PsExec to start the executable on the specified session ID of the remote server
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    //psexec \\RemoteServer -u Username -p Password -accepteula taskkill /S RemoteServer /PID 198999 /F
+                    FileName = RunTimeDir + "psexec64.exe",
+                    // Arguments to execute the executable on the specified session ID of the remote server
+                    Arguments = $@"\\{remoteServer} -u {username} -p {password} -accepteula taskkill /S {remoteServer} /PID {PID} /F",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    Verb = "runas"
+                };
+
+                Process.Start(psi);
+            }
+            catch
+            {
+
+            }
+        }
+
+        #region New
+        private static int CreateNewEngineInstance(string ServerUserName, string ServerPassword, string RunTimeDir, string InstanceType, string ServerIP, out int RDPID)
+        {
+            //return;
+            int highestSessionID = -1;
+            RDPID = 0; 
+            List<int> InitSessionIds = GetSessionIDsList("qwinsta", $"/server:{ServerIP}");
+            if (InitSessionIds.Count > 0)
+            {
+                string serverAddress = ServerIP;// GetServerIP();
+                string username = ServerUserName;
+                string password = ServerPassword;
+                string FileToExe = RunTimeDir + "FaceBookPublisher.EngineController.exe";
+                string exeDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+               /* int highestSessionID = -1;*/// GetHighestSessionID(ServerIP, exeDirectory + @"\psexec64.exe", "tasklist /v /fo csv", "FaceBookPublisher.EngineController.exe");
+                Process cmdkeyProcess = new Process();
+                cmdkeyProcess.StartInfo.FileName = Environment.ExpandEnvironmentVariables(@"%SystemRoot%\system32\cmdkey.exe");
+                cmdkeyProcess.StartInfo.Arguments = $"/generic:TERMSRV/{serverAddress} /user:{username} /pass:{password}";
+                cmdkeyProcess.Start();
+                cmdkeyProcess.WaitForExit();
+
+                Process rdcProcess = new Process();
+                rdcProcess.StartInfo.FileName = Environment.ExpandEnvironmentVariables(@"%SystemRoot%\system32\mstsc.exe");
+                rdcProcess.StartInfo.Arguments = $"/v:{serverAddress}";
+                rdcProcess.Start();
+                rdcProcess.WaitForExit();
+                RDPID = rdcProcess.Id;
+
+                System.Threading.Thread.Sleep(5000); // 5 seconds delay
+
+                //highestSessionID = GetHighestSessionID(ServerIP, exeDirectory + @"\psexec64.exe", "tasklist /v /fo csv", "FaceBookPublisher.EngineController.exe");
+
+                List<int> CurrentSessionIds = GetSessionIDsList("qwinsta", $"/server:{ServerIP}");
+                highestSessionID = FindNewSessionId(InitSessionIds, CurrentSessionIds);
+                if (highestSessionID != -1)
+                {
+                    RunExecutableOnSession(exeDirectory + @"\", highestSessionID, FileToExe + " " + InstanceType + " " + 1, username, password, ServerIP);
+                }
+            }
+            return highestSessionID;
+        }
+
+        static List<int> GetSessionIDsList(string psexecPath, string tasklistCommand)
+        {
+            int highestSessionID = -1;
+            List<int> sessionIds = new List<int>();
+
+            ProcessStartInfo psi = new ProcessStartInfo
+            {
+                FileName = psexecPath,
+                Arguments = $@"{tasklistCommand}",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (Process process = Process.Start(psi))
+            {
+                if (process != null)
+                {
+                    StringBuilder outputBuilder = new StringBuilder();
+
+                    process.OutputDataReceived += (sender, e) =>
+                    {
+                        if (!string.IsNullOrEmpty(e.Data))
+                        {
+                            outputBuilder.AppendLine(e.Data);
+                        }
+                    };
+
+                    process.BeginOutputReadLine();
+                    process.WaitForExit();
+
+                    string output = outputBuilder.ToString();
+
+                    string[] lines = output.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
+
+                    // Iterate over each line to find the highest session ID
+                    foreach (string line in lines)
+                    {
+                        // Use regular expressions to match the session ID, session name, and state
+                        try
+                        {
+                            Match match = Regex.Match(line, @"(\d+)\s+(\S+)\s+(\S+)");
+                            if (match.Success)
+                            {
+                                // Extract session ID, session name, and state
+                                int sessionID = int.Parse(match.Groups[3].Value);
+                                string sessionName = match.Groups[2].Value;
+
+                                // Check if the session ID is greater than 1 and not associated with "Console" or "Services"
+                                if (sessionID > highestSessionID && sessionID > 1 && sessionName != "Console" && sessionName != "Services")
+                                {
+                                    try
+                                    {
+                                        sessionIds.Add(sessionID);
+                                    }
+                                    catch (Exception ex)
+                                    { }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+
+                        }
+                    }
+                }
+            }
+
+            return sessionIds;
+        }
+
+        static int FindNewSessionId(List<int> initialSessionIds, List<int> updatedSessionIds)
+        {
+            foreach (int sessionId in updatedSessionIds)
+            {
+                if (!initialSessionIds.Contains(sessionId))
+                {
+                    return sessionId;
+                }
+            }
+            return -1; // No new session ID found
+        }
+        #endregion
+
+
+
+    }
+	
+	public class SessionDetails
+    {
+        public string ServerIP { get; set; }
+        public bool IsEnoughResources { get; set; }
+        public DateTime TimeStamp { get; set; }
+    }
+	
+	public class Sessions
+    {
+        public string UserName { get; set; }
+        public string Password { get; set; }
+        public string RunTimeDir { get; set; }
+        public string ApplicationName { get; set; }
+        public int ProcessID { get; set; }
+        public int SessionID { get; set; }
+        public DateTime Timestamp { get; set; }
+        public string TelegramSessionFailed { get; set; }
+        public string Env { get; set; }
+        public string InstanceType { get; set; }
+        public string ApplicationToStart { get; set; }
+        public string TelegramBotUrl { get; set; }
+        public string TelegramApiToken { get; set; }
+        public string ServerIP { get; set; }
+        public int TasksWaiting { get; set; }
+        public string Message { get; set; }
+        public DateTime startTime { get; set; }
+        public string MaxCPUAllowed { get; set; }
+        public string CPU { get; set; }
+        public string MaxMemAllowed { get; set; }
+        public string Memory { get; set; }
+        public int MaxSessionsAllowed { get; set; }
+        public List<int> TheTasksInSession { get; set; }
+        public int RDPID { get; set; }
+        public bool IsEnoughResourcesToOpenSessions { get; set; }
+        public int LockedAvatars { get; set; }
+        public int AvailableAvatars { get; set; }
+        public int InPenaltyAvatars { get; set; }
+        public bool IsOnUpdate { get; set; }
+    }
+	
+	 public class SessionView
+    {
+        public List<SessionRepresentation> SessionRepresentationList { get; set; }
+        public List<SessionRepresentationHighLevel> SessionRepresentationHighLevelList { get; set; }
+    }
+public class SessionDetails
+    {
+        public string ServerIP { get; set; }
+        public bool IsEnoughResources { get; set; }
+        public DateTime TimeStamp { get; set; }
+    }
+
+
+
+    public class ReplicaSessionToOpen
+    {
+        public Sessions session { get; set; }
+        public int SessionToOpen { get; set; }
+    }
+}
